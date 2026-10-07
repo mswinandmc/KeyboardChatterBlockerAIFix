@@ -9,6 +9,20 @@ namespace KeyboardChatterBlocker;
 
 public static class Patch
 {
+	/// <summary>Number of SkyHook events seen by the mod (diagnostics).</summary>
+	public static int hookEventCount;
+
+	/// <summary>Number of async key presses the mod suppressed (diagnostics).</summary>
+	public static int blockedAsyncCount;
+
+	/// <summary>Number of synchronous key presses the mod suppressed (diagnostics).</summary>
+	public static int blockedSyncCount;
+
+	/// <summary>Number of scrPlayer.CountValidKeysPressed calls intercepted (diagnostics).</summary>
+	public static int countValidKeysCalls;
+
+	private static int tracedHookEvents;
+
 	private static scrPlayer PlayerOne
 	{
 		get
@@ -34,19 +48,47 @@ public static class Patch
         }
     }
 
-    [HarmonyPatch(typeof(scrPlayer), "CountValidKeysPressed")]
-	public static class scrController_CountValidKeysPressed_Patch
-	{
-		private static int validKeys;
+    /// <summary>Reads the cached controller without exposing the weak reference itself.</summary>
+    public static bool TryGetController(out scrController controller)
+    {
+        controller = CachedInstance;
+        return controller != null;
+    }
 
-		public static void Prefix()
+    /// <summary>
+    /// Synchronous (non SkyHook) input path.
+    ///
+    /// The game calls scrPlayer.CountValidKeysPressed() from ValidInputWasTriggered() and from the
+    /// hold/auto floor handling, so suppressing a chatter repeat there removes the bogus hit.
+    /// Because the game build keeps growing this method (touch input, co-op counting, per-floor
+    /// key limiter bookkeeping in 3.4.0), the mod no longer replaces the result: the game's own
+    /// body still runs and keeps keyFrequency/keyTotal/keyLimiterOverCounter/downKeysDuration up
+    /// to date, and the postfix only subtracts the presses recognised as chatter.
+    /// </summary>
+    [HarmonyPatch(typeof(scrPlayer), "CountValidKeysPressed")]
+	public static class scrPlayer_CountValidKeysPressed_Patch
+	{
+		public static void Prefix(out int __state)
 		{
-			validKeys = CountValidKeysPressed();
+			countValidKeysCalls++;
+			__state = CountChatterRepeats();
 		}
 
-		public static void Postfix(ref int __result)
+		public static void Postfix(ref int __result, int __state)
 		{
-			__result = validKeys;
+			if (__state > 0)
+			{
+				int gameResult = __result;
+				__result = Math.Max(0, __result - __state);
+				if (Main.setting.verboseLogging)
+				{
+					Diagnostics.Trace($"CountValidKeysPressed call #{countValidKeysCalls}: game={gameResult} blocked={__state} -> {__result}");
+				}
+			}
+			else if (Main.setting.verboseLogging && (countValidKeysCalls < 10 || countValidKeysCalls % 300 == 0))
+			{
+				Diagnostics.Trace($"CountValidKeysPressed call #{countValidKeysCalls}: game={__result} blocked=0");
+			}
 		}
 	}
 
@@ -79,11 +121,26 @@ public static class Patch
         }
     }
 
+    /// <summary>
+    /// Asynchronous input path (SkyHook). SkyHookManager.HookCallback is the single entry point
+    /// for native key events in ADOFAI 3.4.0 - it forwards to KeyUpdated, which AsyncInputManager
+    /// turns into its key queue - so returning false here drops the event before the game can
+    /// ever see it.
+    /// </summary>
     [HarmonyPatch(typeof(SkyHookManager), "HookCallback")]
 	public static class SkyHookManager_HookCallback_Patch
 	{
 		public static bool Prefix(SkyHookEvent ev)
 		{
+            hookEventCount++;
+            if (Main.setting.verboseLogging && tracedHookEvents < 40)
+            {
+                tracedHookEvents++;
+                long traceNow = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+                long traceDelta = lastKeyPressAsync.TryGetValue(ev.Key, out long tracePrevious) && tracePrevious > 0 ? traceNow - tracePrevious : -1L;
+                Diagnostics.Trace($"hook event #{hookEventCount}: type={ev.Type} key={ev.Key} label={ev.Label} delta={traceDelta}ms interval={Main.setting.inputInterval} ignored={Main.setting.ignoredAsyncKeys.Contains(ev.Key)} listening={Main.isListeningKeysIgnore}/{Main.isListeningKeysLimiter}");
+            }
+
             if (Main.isListeningKeysIgnore)
             {
                 if (ev.Type == SkyHook.EventType.KeyPressed && !Utils.MouseKeys.Contains(ev.Label))
@@ -123,6 +180,7 @@ public static class Patch
 				Enum state = CachedInstance.stateMachine.GetState();
 				if (state is States && (States)(object)state == States.PlayerControl)
 				{
+					blockedAsyncCount++;
 					return false;
 				}
 			}
@@ -149,6 +207,7 @@ public static class Patch
 			obj[3] = num2.ToString();
 			obj[4] = "ms.";
 			logger.Log(string.Concat(obj));
+			blockedAsyncCount++;
 			return false;
 		}
 	}
@@ -159,6 +218,10 @@ public static class Patch
         public static void Postfix(scrController __instance)
         {
             CachedInstance = __instance;
+            if (Main.setting.verboseLogging)
+            {
+                Diagnostics.Trace($"scrController.Awake -> cached instance ({__instance.name}, gameworld={__instance.gameworld})");
+            }
         }
     }
 
@@ -170,51 +233,62 @@ public static class Patch
 
 	public static Dictionary<KeyCode, long> counted = new Dictionary<KeyCode, long>();
 
-	private static int CountValidKeysPressed()
+	/// <summary>
+	/// Number of main keys pressed during this frame that must not be counted as a valid input.
+	/// Async keys are excluded on purpose: they are filtered in the SkyHook callback where the
+	/// event can be dropped before the game queues it.
+	/// </summary>
+	private static int CountChatterRepeats()
 	{
-		if (!CachedInstance) return 0;
-		int num = 0;
-		long num2 = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-		PlayerOne.keyLimiterOverCounter = 0;
+		if (!CachedInstance)
+		{
+			return 0;
+		}
+		int blocked = 0;
+		long now = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+		scrPlayer playerOne = PlayerOne;
 		foreach (AnyKeyCode mainPressKey in RDInput.GetMainPressKeys())
 		{
-			object value = mainPressKey.value;
-			if (value is KeyCode keyCode)
+			if (!(mainPressKey.value is KeyCode keyCode))
 			{
-				if (Main.setting.enableKeyLimiter && !Main.selectedKeyLimiterProfile.allowedKeys.Contains(keyCode) && !CachedInstance.paused && CachedInstance.gameworld)
+				continue;
+			}
+
+			// Key limiter: keys outside the selected profile are not allowed to hit at all.
+			if (Main.setting.enableKeyLimiter && !Main.selectedKeyLimiterProfile.allowedKeys.Contains(keyCode) && !CachedInstance.paused && CachedInstance.gameworld)
+			{
+				Enum state = CachedInstance.stateMachine.GetState();
+				if (state is States && (States)(object)state == States.PlayerControl)
 				{
-					Enum state = CachedInstance.stateMachine.GetState();
-					if (state is States && (States)(object)state == States.PlayerControl)
-					{
-						continue;
-					}
-				}
-                PlayerOne.keyFrequency[keyCode] = PlayerOne.keyFrequency.ContainsKey(keyCode) ? (PlayerOne.keyFrequency[keyCode] + 1) : 0;
-                PlayerOne.keyTotal++;
-				if (Main.setting.ignoredKeys.Contains(keyCode))
-				{
-					num++;
+					blocked++;
 					continue;
 				}
-				if (!lastKeyPress.ContainsKey(keyCode))
-				{
-					lastKeyPress.Add(keyCode, 0L);
-				}
-				if (num2 - lastKeyPress[keyCode] > Main.setting.inputInterval || num2 - lastKeyPress[keyCode] <= 5)
-				{
-					num++;
-					lastKeyPress[keyCode] = num2;
-					continue;
-				}
-				Main.Logger.Log("Blocked Key: " + keyCode.ToString() + " time: " + (num2 - lastKeyPress[keyCode]) + "ms.");
 			}
-			else if (value is AsyncKeyCode asyncKeyCode)
+
+			// Ignored keys are never filtered by the chatter threshold.
+			if (Main.setting.ignoredKeys.Contains(keyCode))
 			{
-				PlayerOne.keyFrequency[asyncKeyCode] = PlayerOne.keyFrequency.ContainsKey(asyncKeyCode) ? (PlayerOne.keyFrequency[asyncKeyCode] + 1) : 0;
-				PlayerOne.keyTotal++;
-				num++;
+				continue;
 			}
+
+			if (!lastKeyPress.ContainsKey(keyCode))
+			{
+				lastKeyPress.Add(keyCode, 0L);
+			}
+			long delta = now - lastKeyPress[keyCode];
+			// A repeat inside the threshold is chatter; repeats within a few milliseconds are the
+			// same physical press being reported twice and stay valid.
+			if (delta > Main.setting.inputInterval || delta <= 5)
+			{
+				lastKeyPress[keyCode] = now;
+				continue;
+			}
+
+			Main.Logger.Log("Blocked Key: " + keyCode.ToString() + " time: " + delta + "ms.");
+			blockedSyncCount++;
+			blocked++;
 		}
-		return num;
+		_ = playerOne;
+		return blocked;
 	}
 }

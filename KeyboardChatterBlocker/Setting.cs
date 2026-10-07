@@ -11,6 +11,9 @@ public class Setting
 {
 	public int inputInterval = 100;
 
+	/// <summary>Writes detailed diagnostics to the UnityModManager log (SkyHook events, patch results, input interception).</summary>
+	public bool verboseLogging;
+
 	public string lang = "English";
 
 	public List<ushort> ignoredAsyncKeys = new List<ushort>();

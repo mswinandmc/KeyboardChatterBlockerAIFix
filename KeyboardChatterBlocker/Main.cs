@@ -1,8 +1,10 @@
 using HarmonyLib;
 using KeyboardChatterBlocker.Languages;
 using SkyHook;
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using UnityEngine;
@@ -13,6 +15,9 @@ namespace KeyboardChatterBlocker;
 
 public static class Main
 {
+    /// <summary>Version of this port. Bumped when the mod is adapted to a new game build.</summary>
+    public const string ModVersion = "0.1.3";
+
     public static string ModDirectoryPath;
 
     public static ModLogger Logger;
@@ -35,6 +40,8 @@ public static class Main
 
 	public static Dictionary<ushort, string> keyLabels = new Dictionary<ushort, string>();
 
+	private static float statusTimer;
+
 	public static void Setup(ModEntry modEntry)
 	{
 		LoadLanguages();
@@ -45,6 +52,8 @@ public static class Main
                 ? Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)
                 : modEntry.Path;
 		setting = Setting.Load();
+		Diagnostics.Enabled = setting.verboseLogging;
+		Logger.Log($"KeyboardChatterBlocker {modEntry.Info.Version} loading. Game {Application.version}, Unity {Application.unityVersion}, {(IntPtr.Size == 8 ? "64-bit" : "32-bit")}.");
 		modEntry.OnToggle = OnToggle;
 		modEntry.OnGUI = OnGUI;
 		modEntry.OnUpdate = OnUpdate;
@@ -55,15 +64,42 @@ public static class Main
 	{
 		if (value)
 		{
-			harmony = new Harmony(modEntry.Info.Id);
-			harmony.PatchAll(Assembly.GetExecutingAssembly());
-			UpdateSelectedKeyLimiterProfile();
+			try
+			{
+				harmony = new Harmony(modEntry.Info.Id);
+				harmony.PatchAll(Assembly.GetExecutingAssembly());
+				LogPatchedMethods();
+				UpdateSelectedKeyLimiterProfile();
+			}
+			catch (Exception e)
+			{
+				Logger.Error("Could not apply Harmony patches, disabling the mod: " + e);
+				return false;
+			}
 		}
 		else
 		{
-			harmony.UnpatchAll(modEntry.Info.Id);
+			if (harmony != null)
+			{
+				harmony.UnpatchAll(modEntry.Info.Id);
+			}
 		}
 		return true;
+	}
+
+	/// <summary>
+	/// Harmony's PatchAll aborts on the first patch target it cannot resolve, which used to
+	/// leave the mod silently half applied. Logging the resolved targets makes an incompatible
+	/// game build immediately visible in the UnityModManager log.
+	/// </summary>
+	private static void LogPatchedMethods()
+	{
+		List<MethodBase> patched = harmony.GetPatchedMethods().ToList();
+		Logger.Log("Harmony patches applied to " + patched.Count + " methods:");
+		foreach (MethodBase methodBase in patched)
+		{
+			Logger.Log("  " + methodBase.DeclaringType?.FullName + "." + methodBase.Name);
+		}
 	}
 
     private static void OnGUI(ModEntry modEntry)
@@ -107,7 +143,7 @@ public static class Main
         GUILayout.EndHorizontal();
         GUILayout.Space(10f);
         GUILayout.BeginHorizontal();
-        if (AsyncInputManager.isActive)
+        if (IsAsyncInputActive())
         {
             GUILayout.Label(langs[setting.lang].ignored_async_keys + ": ");
             foreach (ushort ignoredAsyncKey in setting.ignoredAsyncKeys)
@@ -141,7 +177,7 @@ public static class Main
         }
         if (GUILayout.Button(langs[setting.lang].clear_keys))
         {
-            if (AsyncInputManager.isActive)
+            if (IsAsyncInputActive())
             {
                 setting.ignoredAsyncKeys.Clear();
             }
@@ -192,7 +228,7 @@ public static class Main
                 GUILayout.EndHorizontal();
                 GUILayout.BeginHorizontal();
                 GUILayout.Space(20f);
-                if (AsyncInputManager.isActive)
+                if (IsAsyncInputActive())
                 {
                     GUILayout.Label(langs[setting.lang].allowed_async_keys + ": ");
                     string text = "";
@@ -230,7 +266,7 @@ public static class Main
                 }
                 if (GUILayout.Button(langs[setting.lang].clear_keys))
                 {
-                    if (AsyncInputManager.isActive)
+                    if (IsAsyncInputActive())
                     {
                         item.allowedAsyncKeys.Clear();
                     }
@@ -253,12 +289,19 @@ public static class Main
         }
         GUILayout.BeginHorizontal();
         GUILayout.EndHorizontal();
+        GUILayout.BeginHorizontal();
+        setting.verboseLogging = GUILayout.Toggle(setting.verboseLogging, langs[setting.lang].verbose_logging);
+        GUILayout.FlexibleSpace();
+        GUILayout.EndHorizontal();
     }
 
-    private unsafe static void OnUpdate(ModEntry modEntry, float value)
+    private static void OnUpdate(ModEntry modEntry, float value)
     {
+        Diagnostics.Enabled = setting.verboseLogging;
+        Diagnostics.Flush();
+
         // Moved Input Tracking into Patching
-        if (!AsyncInputManager.isActive && (isListeningKeysIgnore || isListeningKeysLimiter))
+        if (!IsAsyncInputActive() && (isListeningKeysIgnore || isListeningKeysLimiter))
         {
             NativeInputListener.StartListening();
         }
@@ -285,9 +328,58 @@ public static class Main
             }
         }
         UpdateSelectedKeyLimiterProfile();
+
+        if (setting.verboseLogging)
+        {
+            statusTimer += value;
+            if (statusTimer >= 2f)
+            {
+                statusTimer = 0f;
+                LogStatus();
+            }
+        }
     }
 
-    private static void OnSaveGUI(ModEntry modEntry)
+    /// <summary>
+    /// AsyncInputManager.isActive dereferences SkyHookManager.Instance, which is null before the
+    /// game is playing, so every access has to be guarded.
+    /// </summary>
+    public static bool IsAsyncInputActive()
+    {
+        try
+        {
+            return AsyncInputManager.isActive;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static void LogStatus()
+    {
+        try
+        {
+            string state = "?";
+            bool gameworld = false;
+            bool paused = false;
+            bool hasController = Patch.TryGetController(out scrController controller);
+            if (hasController)
+            {
+                gameworld = controller.gameworld;
+                paused = controller.paused;
+                state = Diagnostics.Describe(controller.stateMachine.GetState());
+            }
+            Diagnostics.Trace($"status async={IsAsyncInputActive()} controller={hasController} paused={paused} gameworld={gameworld} state={state} " +
+                $"hookEvents={Patch.hookEventCount} blockedAsync={Patch.blockedAsyncCount} blockedSync={Patch.blockedSyncCount} countCalls={Patch.countValidKeysCalls}");
+        }
+        catch (Exception e)
+        {
+            Diagnostics.Trace("status probe failed: " + e);
+        }
+    }
+
+	private static void OnSaveGUI(ModEntry modEntry)
 	{
 		setting.Save();
 	}

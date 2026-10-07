@@ -27,4 +27,6 @@ public class Language
 	public string delete_key_limiter_profile;
 
 	public string key_limiter_profile_name;
+
+	public string verbose_logging;
 }

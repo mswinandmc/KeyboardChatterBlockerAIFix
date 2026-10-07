@@ -1,0 +1,9 @@
+{
+  "Id": "KeyboardChatterBlocker",
+  "DisplayName": "KeyboardChatterBlocker",
+  "Author": "Sharky",
+  "Version": "0.1.3",
+  "AssemblyName": "KeyboardChatterBlocker.dll",
+  "EntryMethod": "KeyboardChatterBlocker.Main.Setup",
+  "GameVersion": "3.4.0"
+}

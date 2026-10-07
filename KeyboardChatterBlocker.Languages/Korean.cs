@@ -16,6 +16,7 @@ public class Korean : Language
 		allowed_keys = "입력 허용 키";
 		create_key_limiter_profile = "프로필 생성";
 		delete_key_limiter_profile = "프로필 삭제";
+		verbose_logging = "상세 로그 (진단)";
 		key_limiter_profile_name = "이름";
 	}
 }

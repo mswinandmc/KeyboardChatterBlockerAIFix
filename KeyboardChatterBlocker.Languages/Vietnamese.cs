@@ -16,6 +16,7 @@ public class Vietnamese : Language
 		allowed_keys = "Nút nhận";
 		create_key_limiter_profile = "Tạo thư mục";
 		delete_key_limiter_profile = "Xoá thư mục";
+		verbose_logging = "Nhật ký chi tiết (chẩn đoán)";
 		key_limiter_profile_name = "Tên";
 	}
 }

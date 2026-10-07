@@ -16,6 +16,7 @@ public class English : Language
 		allowed_keys = "Allowed Keys";
 		create_key_limiter_profile = "Create Profile";
 		delete_key_limiter_profile = "Delete Profile";
+		verbose_logging = "Verbose logging (diagnostics)";
 		key_limiter_profile_name = "Name";
 	}
 }

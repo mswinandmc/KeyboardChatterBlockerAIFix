@@ -16,6 +16,7 @@ public class Chinese : Language
 		allowed_keys = "允许的按键";
 		create_key_limiter_profile = "新建配置";
 		delete_key_limiter_profile = "删除配置";
+		verbose_logging = "详细日志（诊断）";
 		key_limiter_profile_name = "名称";
 	}
 }
