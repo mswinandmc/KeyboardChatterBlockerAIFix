@@ -23,55 +23,62 @@ public static class Patch
 
 	private static int tracedHookEvents;
 
-	private static scrPlayer PlayerOne
+	/// <summary>Reused between frames: the current game build fills a caller supplied list.</summary>
+	private static readonly List<AnyKeyCode> mainPressKeysBuffer = new List<AnyKeyCode>();
+
+	private static readonly WeakReference<scrController> _cachedInstanceRef = new WeakReference<scrController>(null);
+
+	private static scrController CachedInstance
 	{
 		get
 		{
-			return CachedInstance.playerOne;
+			if (_cachedInstanceRef.TryGetTarget(out var target) && target != null)
+			{
+				return target;
+			}
+			return null;
+		}
+		set
+		{
+			_cachedInstanceRef.SetTarget(value);
 		}
 	}
 
-    private static readonly WeakReference<scrController> _cachedInstanceRef = new WeakReference<scrController>(null);
-    private static scrController CachedInstance
-    {
-        get
-        {
-            if (_cachedInstanceRef.TryGetTarget(out var target) && target != null)
-            {
-                return target;
-            }
-            return null;
-        }
-        set
-        {
-            _cachedInstanceRef.SetTarget(value);
-        }
-    }
+	/// <summary>Reads the cached controller without exposing the weak reference itself.</summary>
+	public static bool TryGetController(out scrController controller)
+	{
+		controller = CachedInstance;
+		return controller != null;
+	}
 
-    /// <summary>Reads the cached controller without exposing the weak reference itself.</summary>
-    public static bool TryGetController(out scrController controller)
-    {
-        controller = CachedInstance;
-        return controller != null;
-    }
-
-    /// <summary>
-    /// Synchronous (non SkyHook) input path.
-    ///
-    /// The game calls scrPlayer.CountValidKeysPressed() from ValidInputWasTriggered() and from the
-    /// hold/auto floor handling, so suppressing a chatter repeat there removes the bogus hit.
-    /// Because the game build keeps growing this method (touch input, co-op counting, per-floor
-    /// key limiter bookkeeping in 3.4.0), the mod no longer replaces the result: the game's own
-    /// body still runs and keeps keyFrequency/keyTotal/keyLimiterOverCounter/downKeysDuration up
-    /// to date, and the postfix only subtracts the presses recognised as chatter.
-    /// </summary>
-    [HarmonyPatch(typeof(scrPlayer), "CountValidKeysPressed")]
+	/// <summary>
+	/// Synchronous (non SkyHook) input path.
+	///
+	/// The game calls scrPlayer.CountValidKeysPressed() from ValidInputWasTriggered() and from the
+	/// hold/auto floor handling, so suppressing a chatter repeat there removes the bogus hit.
+	/// The game's own body still runs (it maintains keyFrequency/keyTotal, the per-floor key
+	/// limiter, touch input and co-op counting); the postfix only subtracts the presses that were
+	/// recognised as chatter. This keeps the mod additive instead of replacing game logic.
+	/// </summary>
+	[HarmonyPatch(typeof(scrPlayer), "CountValidKeysPressed")]
 	public static class scrPlayer_CountValidKeysPressed_Patch
 	{
 		public static void Prefix(out int __state)
 		{
-			countValidKeysCalls++;
-			__state = CountChatterRepeats();
+			__state = 0;
+			if (Failsafe.SyncDisabled)
+			{
+				return;
+			}
+			try
+			{
+				countValidKeysCalls++;
+				__state = CountChatterRepeats();
+			}
+			catch (Exception exception)
+			{
+				Failsafe.ReportSync(exception);
+			}
 		}
 
 		public static void Postfix(ref int __result, int __state)
@@ -92,82 +99,105 @@ public static class Patch
 		}
 	}
 
-    [HarmonyPatch(typeof(Input), nameof(Input.GetKeyDown), new[] { typeof(KeyCode) })]
-    public static class Unity_GetKeyDown_Patch
-    {
-        public static bool Prefix(KeyCode key, ref bool __result)
-        {
-            if (Main.isListeningKeysIgnore || Main.isListeningKeysLimiter)
-            {
-                __result = false;
-                return false;
-            }
-            return true;
-        }
-    }
+	[HarmonyPatch(typeof(Input), nameof(Input.GetKeyDown), new[] { typeof(KeyCode) })]
+	public static class Unity_GetKeyDown_Patch
+	{
+		public static bool Prefix(KeyCode key, ref bool __result)
+		{
+			if (Main.isListeningKeysIgnore || Main.isListeningKeysLimiter)
+			{
+				__result = false;
+				return false;
+			}
+			return true;
+		}
+	}
 
+	[HarmonyPatch(typeof(Input), nameof(Input.GetKey), new[] { typeof(KeyCode) })]
+	public static class Unity_GetKey_Patch
+	{
+		public static bool Prefix(KeyCode key, ref bool __result)
+		{
+			if (Main.isListeningKeysIgnore || Main.isListeningKeysLimiter)
+			{
+				__result = false;
+				return false;
+			}
+			return true;
+		}
+	}
 
-    [HarmonyPatch(typeof(Input), nameof(Input.GetKey), new[] { typeof(KeyCode) })]
-    public static class Unity_GetKey_Patch
-    {
-        public static bool Prefix(KeyCode key, ref bool __result)
-        {
-            if (Main.isListeningKeysIgnore || Main.isListeningKeysLimiter)
-            {
-                __result = false;
-                return false;
-            }
-            return true;
-        }
-    }
-
-    /// <summary>
-    /// Asynchronous input path (SkyHook). SkyHookManager.HookCallback is the single entry point
-    /// for native key events in ADOFAI 3.4.0 - it forwards to KeyUpdated, which AsyncInputManager
-    /// turns into its key queue - so returning false here drops the event before the game can
-    /// ever see it.
-    /// </summary>
-    [HarmonyPatch(typeof(SkyHookManager), "HookCallback")]
+	/// <summary>
+	/// Asynchronous input path (SkyHook). SkyHookManager.HookCallback is the single entry point
+	/// for native key events: it forwards to SkyHookManager.KeyUpdated, which AsyncInputManager
+	/// turns into its key queue. Returning false here drops the event before the game can see it.
+	/// </summary>
+	[HarmonyPatch(typeof(SkyHookManager), "HookCallback")]
 	public static class SkyHookManager_HookCallback_Patch
 	{
 		public static bool Prefix(SkyHookEvent ev)
 		{
-            hookEventCount++;
-            if (Main.setting.verboseLogging && tracedHookEvents < 40)
-            {
-                tracedHookEvents++;
-                long traceNow = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-                long traceDelta = lastKeyPressAsync.TryGetValue(ev.Key, out long tracePrevious) && tracePrevious > 0 ? traceNow - tracePrevious : -1L;
-                Diagnostics.Trace($"hook event #{hookEventCount}: type={ev.Type} key={ev.Key} label={ev.Label} delta={traceDelta}ms interval={Main.setting.inputInterval} ignored={Main.setting.ignoredAsyncKeys.Contains(ev.Key)} listening={Main.isListeningKeysIgnore}/{Main.isListeningKeysLimiter}");
-            }
+			if (Failsafe.AsyncDisabled)
+			{
+				return true;
+			}
+			try
+			{
+				return HandleHookEvent(ev);
+			}
+			catch (Exception exception)
+			{
+				Failsafe.ReportAsync(exception);
+				return true;
+			}
+		}
 
-            if (Main.isListeningKeysIgnore)
-            {
-                if (ev.Type == SkyHook.EventType.KeyPressed && !Utils.MouseKeys.Contains(ev.Label))
-                {
-                    if (Main.setting.ignoredAsyncKeys.Contains(ev.Key))
-                        Main.setting.ignoredAsyncKeys.Remove(ev.Key);
-                    else
-                        Main.setting.ignoredAsyncKeys.Add(ev.Key);
-                    Main.UpdateSelectedKeyLimiterProfile();
-                }
-                return false; 
-            }
+		private static bool HandleHookEvent(SkyHookEvent ev)
+		{
+			hookEventCount++;
+			if (Main.setting.verboseLogging && tracedHookEvents < 40)
+			{
+				tracedHookEvents++;
+				long traceNow = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+				long traceDelta = lastKeyPressAsync.TryGetValue(ev.Key, out long tracePrevious) && tracePrevious > 0 ? traceNow - tracePrevious : -1L;
+				Diagnostics.Trace($"hook event #{hookEventCount}: type={ev.Type} key={ev.Key} label={ev.Label} delta={traceDelta}ms interval={Main.setting.inputInterval} ignored={Main.setting.ignoredAsyncKeys.Contains(ev.Key)} listening={Main.isListeningKeysIgnore}/{Main.isListeningKeysLimiter}");
+			}
 
-            if (Main.isListeningKeysLimiter)
-            {
-                if (ev.Type == SkyHook.EventType.KeyPressed && !Utils.MouseKeys.Contains(ev.Label))
-                {
-                    if (Main.listeningKeyLimiterProfile.allowedAsyncKeys.Contains(ev.Key))
-                        Main.listeningKeyLimiterProfile.allowedAsyncKeys.Remove(ev.Key);
-                    else
-                        Main.listeningKeyLimiterProfile.allowedAsyncKeys.Add(ev.Key);
-                    Main.UpdateSelectedKeyLimiterProfile();
-                }
-                return false; 
-            }
+			if (Main.isListeningKeysIgnore)
+			{
+				if (ev.Type == SkyHook.EventType.KeyPressed && !Utils.MouseKeys.Contains(ev.Label))
+				{
+					if (Main.setting.ignoredAsyncKeys.Contains(ev.Key))
+					{
+						Main.setting.ignoredAsyncKeys.Remove(ev.Key);
+					}
+					else
+					{
+						Main.setting.ignoredAsyncKeys.Add(ev.Key);
+					}
+					Main.UpdateSelectedKeyLimiterProfile();
+				}
+				return false;
+			}
 
-            if (CachedInstance is null)
+			if (Main.isListeningKeysLimiter)
+			{
+				if (ev.Type == SkyHook.EventType.KeyPressed && !Utils.MouseKeys.Contains(ev.Label))
+				{
+					if (Main.listeningKeyLimiterProfile.allowedAsyncKeys.Contains(ev.Key))
+					{
+						Main.listeningKeyLimiterProfile.allowedAsyncKeys.Remove(ev.Key);
+					}
+					else
+					{
+						Main.listeningKeyLimiterProfile.allowedAsyncKeys.Add(ev.Key);
+					}
+					Main.UpdateSelectedKeyLimiterProfile();
+				}
+				return false;
+			}
+
+			if (CachedInstance is null)
 			{
 				return true;
 			}
@@ -192,11 +222,11 @@ public static class Patch
 			{
 				lastKeyPressAsync.Add(ev.Key, 0L);
 			}
-			long num = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-			long num2 = num - lastKeyPressAsync[ev.Key];
-			if (num2 > Main.setting.inputInterval)
+			long now = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+			long delta = now - lastKeyPressAsync[ev.Key];
+			if (delta > Main.setting.inputInterval)
 			{
-				lastKeyPressAsync[ev.Key] = num;
+				lastKeyPressAsync[ev.Key] = now;
 				return true;
 			}
 			ModLogger logger = Main.Logger;
@@ -204,7 +234,7 @@ public static class Patch
 			KeyLabel label = ev.Label;
 			obj[1] = label.ToString();
 			obj[2] = " time: ";
-			obj[3] = num2.ToString();
+			obj[3] = delta.ToString();
 			obj[4] = "ms.";
 			logger.Log(string.Concat(obj));
 			blockedAsyncCount++;
@@ -212,20 +242,20 @@ public static class Patch
 		}
 	}
 
-    [HarmonyPatch(typeof(scrController), "Awake")]
-    private static class scrController_Awake_Patch
-    {
-        public static void Postfix(scrController __instance)
-        {
-            CachedInstance = __instance;
-            if (Main.setting.verboseLogging)
-            {
-                Diagnostics.Trace($"scrController.Awake -> cached instance ({__instance.name}, gameworld={__instance.gameworld})");
-            }
-        }
-    }
+	[HarmonyPatch(typeof(scrController), "Awake")]
+	private static class scrController_Awake_Patch
+	{
+		public static void Postfix(scrController __instance)
+		{
+			CachedInstance = __instance;
+			if (Main.setting.verboseLogging)
+			{
+				Diagnostics.Trace($"scrController.Awake -> cached instance ({__instance.name}, gameworld={__instance.gameworld})");
+			}
+		}
+	}
 
-    public static Dictionary<ushort, long> lastKeyPressAsync = new Dictionary<ushort, long>();
+	public static Dictionary<ushort, long> lastKeyPressAsync = new Dictionary<ushort, long>();
 
 	public static Dictionary<KeyCode, long> lastKeyPress = new Dictionary<KeyCode, long>();
 
@@ -240,14 +270,24 @@ public static class Patch
 	/// </summary>
 	private static int CountChatterRepeats()
 	{
-		if (!CachedInstance)
+		scrController controller = CachedInstance;
+		if (controller == null)
 		{
 			return 0;
 		}
+
+		// Resolved at runtime: the 2026-10-21 build changed the signature from
+		// "List<AnyKeyCode> GetMainPressKeys()" to "void GetMainPressKeys(List<AnyKeyCode>)".
+		List<AnyKeyCode> pressKeys = GameCompat.GetMainPressKeys(mainPressKeysBuffer);
+		if (pressKeys == null)
+		{
+			GameCompat.WarnIfUnavailable();
+			return 0;
+		}
+
 		int blocked = 0;
 		long now = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-		scrPlayer playerOne = PlayerOne;
-		foreach (AnyKeyCode mainPressKey in RDInput.GetMainPressKeys())
+		foreach (AnyKeyCode mainPressKey in pressKeys)
 		{
 			if (!(mainPressKey.value is KeyCode keyCode))
 			{
@@ -255,9 +295,9 @@ public static class Patch
 			}
 
 			// Key limiter: keys outside the selected profile are not allowed to hit at all.
-			if (Main.setting.enableKeyLimiter && !Main.selectedKeyLimiterProfile.allowedKeys.Contains(keyCode) && !CachedInstance.paused && CachedInstance.gameworld)
+			if (Main.setting.enableKeyLimiter && !Main.selectedKeyLimiterProfile.allowedKeys.Contains(keyCode) && !controller.paused && controller.gameworld)
 			{
-				Enum state = CachedInstance.stateMachine.GetState();
+				Enum state = controller.stateMachine.GetState();
 				if (state is States && (States)(object)state == States.PlayerControl)
 				{
 					blocked++;
@@ -288,7 +328,6 @@ public static class Patch
 			blockedSyncCount++;
 			blocked++;
 		}
-		_ = playerOne;
 		return blocked;
 	}
 }

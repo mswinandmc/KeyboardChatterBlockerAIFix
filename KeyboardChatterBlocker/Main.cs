@@ -16,7 +16,7 @@ namespace KeyboardChatterBlocker;
 public static class Main
 {
     /// <summary>Version of this port. Bumped when the mod is adapted to a new game build.</summary>
-    public const string ModVersion = "0.1.3";
+    public const string ModVersion = "0.2.0";
 
     public static string ModDirectoryPath;
 
@@ -54,6 +54,8 @@ public static class Main
 		setting = Setting.Load();
 		Diagnostics.Enabled = setting.verboseLogging;
 		Logger.Log($"KeyboardChatterBlocker {modEntry.Info.Version} loading. Game {Application.version}, Unity {Application.unityVersion}, {(IntPtr.Size == 8 ? "64-bit" : "32-bit")}.");
+		Logger.Log("Game compat: " + GameCompat.Description + ".");
+		GameCompat.WarnIfUnavailable();
 		modEntry.OnToggle = OnToggle;
 		modEntry.OnGUI = OnGUI;
 		modEntry.OnUpdate = OnUpdate;
@@ -371,7 +373,8 @@ public static class Main
                 state = Diagnostics.Describe(controller.stateMachine.GetState());
             }
             Diagnostics.Trace($"status async={IsAsyncInputActive()} controller={hasController} paused={paused} gameworld={gameworld} state={state} " +
-                $"hookEvents={Patch.hookEventCount} blockedAsync={Patch.blockedAsyncCount} blockedSync={Patch.blockedSyncCount} countCalls={Patch.countValidKeysCalls}");
+                $"hookEvents={Patch.hookEventCount} blockedAsync={Patch.blockedAsyncCount} blockedSync={Patch.blockedSyncCount} countCalls={Patch.countValidKeysCalls} " +
+                $"syncPath={GameCompat.HasPressKeyEnumeration} failsafeSync={Failsafe.SyncDisabled} failsafeAsync={Failsafe.AsyncDisabled}");
         }
         catch (Exception e)
         {
